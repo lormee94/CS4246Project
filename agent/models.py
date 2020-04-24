@@ -1,6 +1,7 @@
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
+import torch.nn.functional as Fn
 
 class Base(nn.Module):
     def __init__(self, input_shape, num_actions):
@@ -58,3 +59,18 @@ class AtariDQN(DQN):
             nn.ReLU(),
             nn.Linear(512, self.num_actions)
         )
+
+class RTrailNetwork(nn.Module):
+    def __init__(self):
+        super(RTrailNetwork, self).__init__()
+        self.fc1 = nn.Linear(150, 100)
+        self.fc2 = nn.Linear(100, 100)
+        self.fc3_output = nn.Linear(100, 50)
+        self.fc3_hidden = nn.Linear(100, 50)
+
+    def forward(self, x):
+        x = Fn.relu(self.fc1(x))
+        x = Fn.relu(self.fc2(x))
+        x_output = torch.sigmoid(self.fc3_output(x))
+        x_hidden = Fn.relu(self.fc3_hidden(x))
+        return (x_output, x_hidden)

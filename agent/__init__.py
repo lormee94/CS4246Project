@@ -5,7 +5,7 @@ except:
 import random
 import math
 import numpy as np
-from models import ConvDQN
+from models import ConvDQN, RTrailNetwork
 import collections
 import os
 import torch
@@ -59,24 +59,19 @@ class ReplayBuffer():
 
 
 class ExampleAgent(Agent):
-    '''
-    An example agent that just output a random action.
-    '''
     def __init__(self, *args, **kwargs):
-        '''
-        [OPTIONAL]
-        Initialize the agent with the `test_case_id` (string), which might be important
-        if your agent is test case dependent.
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.rtrailnet1 = RTrailNetwork()
+        self.rtrailnet1.load_state_dict(torch.load('rtrailnet1.model', map_location=lambda storage, loc: storage))
+        self.rtrailnet1.to(self.device)
+        self.rtrailnet1.eval()
+        self.rtrailnet2 = RTrailNetwork()
+        self.rtrailnet2.load_state_dict(torch.load('rtrailnet2.model', map_location=lambda storage, loc: storage))
+        self.rtrailnet2.to(self.device)
+        self.rtrailnet2.eval()
+        self.trail1 = torch.zeros(10, 50).to(self.device)
+        self.trail2 = torch.zeros(10, 50).to(self.device)
         
-        For example, you might want to load the appropriate neural networks weight 
-        in this method.
-        '''
-        #test_case_id = kwargs.get('test_case_id')
-        '''
-        # Uncomment to help debugging
-        print('>>> __INIT__ >>>')
-        print('test_case_id:', test_case_id)
-        '''
         # initiate the preference matrix
         self.pref = self.init_pref(10,50)
         self.model = kwargs.get('model')
@@ -113,6 +108,7 @@ class ExampleAgent(Agent):
 
         This function will be called once before the evaluation.
         '''
+
         fast_downward_path  = kwargs.get('fast_downward_path')
         agent_speed_range   = kwargs.get('agent_speed_range')
         gamma               = kwargs.get('gamma')
@@ -150,45 +146,6 @@ class ExampleAgent(Agent):
         else:
             return x,l(y-3)
 
-
-    def compute_p_helper(self,original,new,car,maxCar,speedRange,agent=0):
-        if car == maxCar:
-            p_action = 1/(speedRange[1]-speedRange[0]+1)
-            p_product = 1
-            for car in range(maxCar):
-                p_product *= p_action
-                if car != 0:
-                    if new[car] <= new[car-1]:
-                        return 0
-                    elif new[car] == (new[car-1]+1):
-                        p_product *= (new[car]-(original[car]+speedRange[0])+1)
-            return p_product
-        else:
-            sum_ = 0
-            minSpeed = speedRange[1]
-            maxSpeed = speedRange[0]
-            for speed in range(maxSpeed,minSpeed+1):
-                new[car] = original[car]+speed
-                if agent >= new[car] and agent <= (original[car]+minSpeed):
-                    continue
-                sum_ += self.compute_p_helper(original,new,car+1,maxCar,speedRange,agent)
-            return sum_
-
-    def compute_p(self,x,y,state):
-        lane = state[0][x]
-        cut = lane[y:y+4]
-        if (y+4)>len(lane):
-            cut = np.append(cut,lane[:(y+4)%len(lane)])
-        original = []    
-        for i in range(len(cut)):
-            if cut[i] == 1:
-                original.append(i)
-        original = np.array(original,dtype=np.intc)
-        new = np.zeros(len(original),dtype=np.intc)
-        # get speed range from the environment
-        speedRange = [-3,-1]
-        return self.compute_p_helper(original,new,0,len(original),speedRange,0)
-
     def step(self, state, *args, **kwargs):
         ''' 
         [REQUIRED]
@@ -209,30 +166,61 @@ class ExampleAgent(Agent):
         print('state:', state)
         '''
         epsilon = kwargs.get('epsilon')
-        x,y = self.get_agent_pos(state)    
-        backupState = np.copy(state)
+        x,y = self.get_agent_pos(state)
+        final_action = 4
+
+        with torch.no_grad():
+            (next_trail1, self.trail1) = self.rtrailnet1(torch.cat(
+                    [torch.Tensor(state[0]).to(self.device), torch.Tensor(state[3]).to(self.device), self.trail1], 
+                    dim=1))
+            (next_trail2, self.trail2) = self.rtrailnet1(torch.cat(
+                    [torch.Tensor(state[0]).to(self.device), torch.Tensor(state[3]).to(self.device), self.trail2], dim=1))
+        
+        max_speed = -1
+        if y - 1 >= 0 and state[0][x][y - 1] == 0:
+            max_speed = -2
+            if x - 2 >= 0 and state[0][x][y - 2] == 0:
+                max_speed = -3
+
+        if x == 0:
+            final_action = 5 + max_speed
+        if y <= x:
+            final_action = 0
+        if y == x + 1 and max_speed < -1:
+            max_speed = -1
+        if y == x + 2 and max_speed < -2:
+            max_speed = -2
+        
+        probabilities = np.zeros(5)
+        probabilities[0] = 0.0
+        for speed in range(-1, max_speed - 1, -1):
+            probabilities[speed] = 0.0
+        if y - 1 >= 0:
+            probabilities[0] = 1 - next_trail1[x - 1][y - 1].item()
+        for spd in range(-1, max_speed - 1, -1):
+            if y - 1 + spd >= 0:
+                probabilities[spd] = 1 - next_trail2[x - 1][y - 1 + spd].item()
+        if probabilities[0] >= 0.95:
+            final_action = 0
+        for spd in range(-1, max_speed - 1, -1):
+            if probabilities[spd] >= 0.98:
+                final_action = 5 + spd
+
         if not isinstance(state,torch.FloatTensor):
             state = torch.from_numpy(state).float().unsqueeze(0).to(device)
         Q_values = self.model.forward(state)
-        p_noCollision = np.zeros(5)
         pref = np.zeros(5)
         for action in range(5):
             x1,y1 = self.new_pos(x,y,action)
-            p_noCollision[action] = self.compute_p(x1,y1,backupState)
             pref[action] = self.pref[x1][y1]
-
-        Tensor_p_noCollision = torch.tensor(p_noCollision,dtype=torch.float,device=device)
+        Tensor_prob = torch.tensor(probabilities,dtype=torch.float,device=device)
         Tensor_pref = torch.tensor(pref,dtype=torch.float,device=device)
-        final_term = Q_values + epsilon*Tensor_p_noCollision + epsilon*Tensor_pref
+        final_term = Q_values + epsilon*Tensor_prob + epsilon*Tensor_pref
         
-        safe_action = torch.tensor(p_noCollision,dtype=torch.float) + 0.5*torch.tensor(pref,dtype=torch.float)
-
-        idx = torch.argmax(final_term).item()
-
         sample = random.random()
-        if sample < epsilon:
-            idx = torch.argmax(safe_action).item()
-        return idx  
+        if sample > epsilon:
+            final_action = torch.argmax(final_term).item()
+        return final_action
 
     def update(self, *args, **kwargs):
         '''
@@ -269,7 +257,7 @@ class ExampleAgent(Agent):
         print('done:', done)
         print('info:', info)
         '''
-
+        pass
 
 def create_agent(model, *args, **kwargs):
     '''
